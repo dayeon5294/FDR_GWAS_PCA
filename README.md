@@ -12,10 +12,10 @@ The study proposes two covariate-assisted procedures for false discovery rate (F
 
 ```
 FDR-GWAS-PCA/
-├── data/
+├── Data/
 │   ├── data_chro.zip                    # Compressed summary statistics for BMI (from GIANT)
 │   └── [external] LD scores & MAF       # See links below for original sources
-├── code/
+├── Code/
 │   ├── R/
 │   │   ├── SNP_analysis.Rmd                      # Preprocessing of GWAS data
 │   │   ├── Simulation with IHW method.Rmd        # Simulation data generation using IHW
@@ -46,7 +46,12 @@ To replicate the main findings:
     → Download: `1000G_Phase3_frq.tgz`  
     - Contains files for chromosomes 1–22 with MAF per SNP.
 
-> Note: Due to file size constraints, only the BMI summary statistics used in our real-data analysis are included directly in this repository. LD score and MAF data used in the study can be obtained from the original sources linked above.
+4. Run the R Markdown files in `/Code/R/` to preprocess data and generate simulation input.
+5. Use the Jupyter notebooks in `/Code/Python/` to generate and visualize the final results.
+
+> Note:
+> - Only a subset of BMI summary statistics used in our real-data analysis is included here.  
+> - Final result tables (e.g., rejection lists and summaries) are not stored in the repository due to size limitations but can be regenerated using the provided analysis notebooks. These will be saved automatically under `/Data/result_final/`.
 
 ## Citation
 
