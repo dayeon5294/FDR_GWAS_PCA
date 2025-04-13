@@ -1,7 +1,6 @@
 ---
 title: "IHW simulation_cov30"
-author: "Jung Da Yeon"
-date: "2024-02-09"
+author: "Dayeon Jung"
 output: html_document
 ---
 
