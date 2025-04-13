@@ -172,3 +172,17 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# R-related files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.Rproj
+
+# VS Code settings (if using)
+.vscode/
+
+# Project-specific outputs
+output/
+results/
