@@ -34,7 +34,7 @@ To replicate the main findings:
 1. Install R (≥ 4.1.0) and Python (≥ 3.8) with the necessary packages.
 2. Extract the BMI summary statistics file from `/data/BMI_chr3_summary.zip`.
 3. Download the following external datasets:
-   - **LD scores** (baseline model):  
+  - **LD scores** (baseline model):  
     [LD Score Regression Annotations – BaselineLD](https://alkesgroup.broadinstitute.org/LDSCORE/)  
     → Download: `1000G_Phase3_baselineLD_ldscores.tgz`  
     - Use `.annot` files to determine SNP membership in functional groups (binary annotation: 0/1).  
