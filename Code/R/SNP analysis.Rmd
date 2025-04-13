@@ -1,0 +1,418 @@
+---
+title: "SNP analysis"
+author: "Dayeon Jung"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 0. package
+
+```{r, message = FALSE, warning=FALSE}
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+# BiocManager::install("DESeq2")
+# BiocManager::install("qvalue")
+# BiocManager::install("IHW")
+# BiocManager::install("swfdr")
+
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("doRNG")) install.packages("doRNG")
+
+library(dplyr)
+library(stats)
+library(ggplot2)
+library("DESeq2")
+library(qvalue)
+library("IHW")
+library(swfdr)
+library(gridExtra)
+
+library(splines)
+library(MASS)
+library(xtable)
+library(doParallel) 
+library(foreach) 
+library(doRNG)
+```
+
+
+## 1. Data upload & preprocess
+
+
+```{r data process}
+setwd("/FDR_GWAS_PCA/Code/R")
+#################### data uploading
+BMI.sumstats <- read.table("../../Data/data_chro/BMI.sumstats.txt", sep="\t", header = TRUE)
+BMI.sumstats <- na.omit(BMI.sumstats)
+BMI.sumstats$chi <- (BMI.sumstats$Z)^2
+BMI.sumstats$pval <- 1 - pchisq(BMI.sumstats$chi, df = 1)
+BMI.sumstats$z.score <- qnorm(1 - BMI.sumstats$pval)
+BMI.sumstats <- subset(BMI.sumstats, select = c(SNP, pval, z.score))
+
+#################### data preprocessing 
+chro <- data.frame()
+for (i in 1:22){
+  print(i)
+  tmp <- read.delim(sprintf("../../Data/data_chro/baseline.%d.l2.ldscore.gz", i), header=TRUE)
+  tmp2 <- read.delim(sprintf("../../Data/data_chro/baseline.%d.annot.gz", i), header=TRUE)
+  tmp2 <- tmp2[tmp2$SNP %in% tmp$SNP, ]
+  chromosome.ldscore <- cbind(tmp[,c("CHR","SNP","BP")], tmp[,4:56] * tmp2[, 5:57])
+  chromosome.ldscore <- chromosome.ldscore[-c(grep("extend", names(chromosome.ldscore)))]
+  chromosome.ldscore <- subset(chromosome.ldscore, select = -c(BP))
+  
+  chromosome.MAF <- read.table(sprintf("../../Data/data_chro/1000G.EUR.QC.%d.txt", i),  header = TRUE)
+  chromosome.MAF <- subset(chromosome.MAF, select = -c(A1, A2, NCHROBS))
+  
+  chro.tmp <- inner_join(chromosome.ldscore, chromosome.MAF)
+  chro <- rbind(chro, chro.tmp)
+  rm(tmp) ; rm(tmp2) ; rm(chromosome.ldscore) ; rm(chromosome.MAF) ; rm(chro.tmp) 
+}
+
+chro.all <- inner_join(BMI.sumstats, chro)
+rm(BMI.sumstats) ; rm(chro)
+
+str(chro.all)
+
+write.csv(chro.all, file = "../../Data/data_chro/chro_all.csv")
+chro.all <- read.table("../../Data/data_chro/chro_all.csv", sep = ",", header = T)
+chro.all <- chro.all[, -1]
+```
+
+
+```{r functions}
+##-----logistic regression version of estimate----------------------------------
+lm_pi0 <- function(pValues, lambda = seq(0.05, 0.95, 0.05), X, smooth.df=3, threshold=TRUE){
+  ##if X is a vector, change it into a matrix
+  if(is.null(dim(X))){ X <- matrix(X, ncol=1)}
+  
+  ##number of tests
+  n <- nrow(X)
+  ##number of lambdas
+  nLambda <- length(lambda)
+  
+  ##get the estimate for each value of lambda 
+  pi0.lambda <- matrix(NA, nrow=n, ncol=nLambda)
+  for(i in 1:nLambda){
+    lambda.i <- lambda[i]
+    y <- pValues > lambda.i
+    
+    ##fit regression
+    regFit <- glm(y ~ as.matrix(X), family=binomial)
+    
+    ##get the estimated values of pi0
+    pi0.lambda[,i] <- regFit$fitted.values/(1-lambda.i)
+    
+    if(threshold){
+      pi0.lambda[,i] <- ifelse(pi0.lambda[,i] > 1, 1, pi0.lambda[,i])
+      pi0.lambda[,i] <- ifelse(pi0.lambda[,i] < 0, 0, pi0.lambda[,i])
+    }
+  }
+  
+  ##smooth over values of lambda (do this for each test in part)
+  pi0.smooth <- matrix(NA, nrow=n, ncol=nLambda)
+  ##also save final estimate (maximum of 0 and minimum of 1 and smoothed value at largest lambda)
+  pi0 <- rep(NA, length=n)
+  for(i in 1:n){
+    if(i %% 10000==0){
+      message(paste("At test #:",i))
+    }
+    spi0 <- smooth.spline(lambda, pi0.lambda[i,], df=smooth.df)
+    pi0.smooth[i, ] <- spi0$y
+    pi0[i] <- pi0.smooth[i,nLambda]
+  }
+  
+  if(threshold){ 
+    pi0 <- ifelse(pi0 > 1, 1, pi0)
+    pi0 <- ifelse(pi0 < 0, 0, pi0)
+  }
+  
+  return(list(pi0=pi0, pi0.lambda=pi0.lambda, lambda=lambda, pi0.smooth=pi0.smooth))
+}
+
+##-----do this without the lm_pi0 function in swfdr-----------------------------
+estimate_pi0x <- function(pValues, X){
+  ntest <- nrow(pValues)
+  
+  ##sequence of lambdas
+  lambdas <- round(seq(0.05, 0.95, 0.05),2)
+  
+  res <- lm_pi0(pValues, lambda=lambdas, X=X, smooth.df=3)
+  
+  pi0Est <- res$pi0
+}
+
+##-----Function to get q-values for each method---------------------------------
+getQValuesFWER <- function(pValues){
+  # 행 단위로 ntest개의 pvalue에 대해 BH 계산
+  t(apply(pValues, 1, p.adjust, method="bonferroni"))}
+
+getQValuesBH <- function(pValues){
+  # 행 단위로 ntest개의 pvalue에 대해 BH 계산
+  t(apply(pValues, 1, p.adjust, method="BH"))}
+
+getQValuesStorey <- function(pValues){
+  t(apply(pValues, 1, function(p){t <- try(qvalue(p)$qvalues, silent=TRUE);
+  if(mode(t)!="numeric"){t <- rep(NA, length=length(p))}; t}))}
+
+getQValuesSimsIHW <- function(pValues, x, a){
+  obj <- ihw(pValues, x, alpha=a, nbins=20, nfolds=5,
+             distrib_estimator="grenander", lp_solver="lpsymphony")
+  result <- adj_pvalues(obj)
+  return(result)
+}
+
+getQValuesSimsBL <- function(pValues, X){
+  pi0hat <- lm_pi0(p = pValues, X = X)
+  adj_p <- pi0hat$pi0 * p.adjust(pValues, method = "BH")
+  return(adj_p)
+}
+```
+
+
+## 2. BH & q-value
+
+```{r BH and qval}
+#################### pval vs BH vs qvalue
+pval.compared.all <- data.frame()
+
+for (i in 1:22){
+  print(i)
+  chro <- chro.all[chro.all$CHR == i,]
+  pval.compared <- subset(chro, select = c(CHR, SNP, pval))
+  pval.compared$FWER <- array(getQValuesFWER(t(as.data.frame(pval.compared$pval))))
+  pval.compared$BH <- array(getQValuesBH(t(as.data.frame(pval.compared$pval))))
+  pval.compared$qval <- array(getQValuesStorey(t(as.data.frame(pval.compared$pval)))) 
+  
+  pval.compared.all <- rbind(pval.compared.all, pval.compared)
+  rm(pval.compared)
+}
+
+#str(pval.compared.all)
+
+write.csv(pval.compared.all, file = "../../Data/result_final/resultSNP/pval_compared_all.csv")
+
+#################### Rejected SNPs of each method 
+for (i in 1:22){
+  pval.compared <- pval.compared.all[pval.compared.all$CHR == i, ]
+  SNP.FWER <- rownames(pval.compared[pval.compared$FWER <= 0.05,])
+  SNP.BH <- rownames(pval.compared[pval.compared$BH <= 0.05,])
+  SNP.qval <- rownames(pval.compared[pval.compared$qval <= 0.05,])
+  
+  print(sprintf("CHR %d, FWER: %d, BH: %d, Storey: %d", i, length(SNP.FWER), length(SNP.BH), length(SNP.qval)))
+  #print(paste("   Common SNPs between FWER and BH:", length(intersect(SNP.BH, SNP.FWER))))
+  #print(paste("   Common SNPs between BH and qval:", length(intersect(SNP.BH, SNP.qval))))
+}
+```
+
+
+## 3. IHW (Independent Hypothesis Weighting)
+
+```{r IHW}
+# chro.ihw.all: pval vs IHW with each covariate
+for (i in 1:22){
+  print(i)
+  chro <- chro.all[chro.all$CHR == i,]
+  chro.ihw <- subset(chro, select = c(CHR, pval))
+  rownames(chro.ihw) <- chro$SNP
+  for (j in c(1:30)){
+    chro.ihw <- cbind(chro.ihw, getQValuesSimsIHW(chro$pval, chro[,j+4], 0.05))
+  }
+  colnames(chro.ihw) <- c("CHR", "pval", colnames(chro)[5:34])
+  write.csv(chro.ihw, file = sprintf("../../Data/result_final/resultSNP/chro_ihw_%d.csv", i))
+}
+
+chro.ihw.all <- data.frame()
+for (i in 1:22){
+  chro.ihw <- read.table(sprintf("../../Data/result_final/resultSNP/chro_ihw_%d.csv", i), sep = ",", header = T)
+  chro.ihw.all <- rbind(chro.ihw.all, chro.ihw)
+  }
+
+write.csv(chro.ihw.all, file = "../../Data/result_final/resultSNP/chro_ihw_all.csv")
+```
+
+
+## 4. BL (Boca and Leek)
+
+```{r BL, warning=FALSE, message=FALSE}
+# Original covariate
+for (i in 1:22){
+  print(i)
+  chro <- chro.all[chro.all$CHR == i,]
+  chro.bl <- subset(chro, select = c(CHR, pval))
+  rownames(chro.bl) <- chro$SNP
+  for (j in c(1:30)){
+    chro.bl <- cbind(chro.bl, getQValuesSimsBL(chro$pval, chro[,j+4]))
+  }
+  colnames(chro.bl) <- c("CHR", "pval", colnames(chro)[5:34])
+  write.csv(chro.bl, file = sprintf("../../Data/result_final/resultSNP/chro_bl_%d.csv", i))
+}
+
+chro.bl.all <- data.frame()
+for (i in 1:22){
+  chro.bl <- read.table(sprintf("../../Data/result_final/resultSNP/chro_bl_%d.csv", i), sep = ",", header = T)
+  chro.bl.all <- rbind(chro.bl.all, chro.bl)
+  }
+
+write.csv(chro.bl.all, file = "../../Data/result_final/resultSNP/chro_bl_all.csv")
+```
+
+
+## 5. Principal component analysis
+
+```{r pca}
+chro <- chro.all[chro.all$CHR == 3,]
+chro.X <- chro[,5:length(chro)]
+chro.X.pca <- prcomp(chro.X, center = TRUE, scale. = TRUE)
+
+summary(chro.X.pca)
+write.csv(chro.X.pca, file = "../../Data/data_chro/chro_X_pca.csv")
+```
+
+
+## 6. IHW (Independent Hypothesis Weighting) : Principal component analysis
+
+```{r IHW pca, warning=FALSE}
+# chro.ihw.pca.all: pval vs IHW with each covariate
+for (i in 1:22){
+  print(i)
+  chro <- chro.all[chro.all$CHR == i,]
+  chro.X <- chro[,5:length(chro)]
+  chro.X.pca <- prcomp(chro.X, center = TRUE, scale. = TRUE)
+  
+  chro.ihw <- subset(chro, select = c(CHR, pval))
+  rownames(chro.ihw) <- chro$SNP
+  for (j in c(1:30)){
+    chro.ihw <- cbind(chro.ihw, getQValuesSimsIHW(chro$pval, chro.X.pca$x[,j], 0.05))
+  }
+  colnames(chro.ihw) <- c("CHR", "pval", colnames(chro.X.pca$x))
+  write.csv(chro.ihw, file = sprintf("../../Data/result_final/resultSNP/chro_ihw_pca_%d.csv", i))
+}
+
+chro.ihw.pca.all <- data.frame()
+for (i in 1:22){
+  chro.ihw <- read.table(sprintf("../../Data/result_final/resultSNP/chro_ihw_pca_%d.csv", i), sep = ",", header = T)
+  chro.ihw.pca.all <- rbind(chro.ihw.pca.all, chro.ihw)
+  }
+
+write.csv(chro.ihw.pca.all, file = "../../Data/result_final/resultSNP/chro_ihw_pca_all.csv")
+```
+
+```{r IHW pca, echo=FALSE, eval=FALSE}
+# chro.3.ihw: pval vs IHW with each covariate
+chro.3.ihw <- matrix(chro.3$pval, dimnames = list(rownames(chro.3), "pval"))
+for (i in c(1:30)){
+  chro.3.ihw <- cbind(chro.3.ihw, adj_pvalues(ihw(chro.3$pval, chro.3.X.pca$x[,i], alpha = 0.05)))
+}
+tmp <- c() ; for (i in c(1:30)){tmp[i] <- paste0("IPW_PC",i)} ; colnames(chro.3.ihw) <- c("pval", tmp) ; rm(tmp)
+chro.3.ihw <- as.data.frame(chro.3.ihw)
+
+
+# rejected SNPs of IHW with PCA
+SNP.ihwPCA <- matrix(NA, nrow = 136, ncol = 30)
+for (i in c(2:31)){
+  tmp <- rownames(chro.3.ihw[chro.3.ihw[, i] <= 0.05,])
+  SNP.ihwPCA[1:length(tmp), i-1] <- tmp
+  rm(tmp)
+}
+
+for (i in c(1:30)){
+  print(paste0(sprintf('rejection # of IHW with PC "%s" is ', i), sum(!is.na(SNP.ihwPCA[,i]))))
+}
+
+write.csv(pval.compared, file = "../../Data/result_final/resultSNP/pval_compared_3.csv")
+write.csv(chro.3.ihw, file = "../../Data/result_final/resultSNP/chro_3_ihw_pca.csv")
+```
+
+
+## 8. BL (Boka and Leek) : Principal component analysis
+
+```{r BL pca, warning=FALSE, message=FALSE}
+# Original covariate
+for (i in 1:22){
+  print(i)
+  chro <- chro.all[chro.all$CHR == i,]
+  chro.X <- chro[,5:length(chro)]
+  chro.X.pca <- prcomp(chro.X, center = TRUE, scale. = TRUE)
+  
+  chro.bl <- subset(chro, select = c(CHR, pval))
+  rownames(chro.bl) <- chro$SNP
+  for (j in c(1:30)){
+    chro.bl <- cbind(chro.bl, getQValuesSimsBL(chro$pval, chro.X.pca$x[,j]))
+  }
+  colnames(chro.bl) <- c("CHR", "pval", colnames(chro.X.pca$x))
+  write.csv(chro.bl, file = sprintf("../../Data/result_final/resultSNP/chro_bl_pca_%d.csv", i))
+}
+
+chro.bl.pca.all <- data.frame()
+for (i in 1:22){
+  chro.bl <- read.table(sprintf("../../Data/result_final/resultSNP/chro_bl_pca_%d.csv", i), sep = ",", header = T)
+  chro.bl.pca.all <- rbind(chro.bl.pca.all, chro.bl)
+  }
+
+write.csv(chro.bl.pca.all, file = "../../Data/result_final/resultSNP/chro_bl_pca_all.csv")
+```
+
+```{r BL PCA each, echo=FALSE, eval=FALSE}
+blfdr <- function(pValues, x) {
+    pi0hat <- lm_pi0(p = pValues, X = x)
+    adj_p <- pi0hat$pi0 * p.adjust(pValues, method = "BH")
+    return(adj_p)
+}
+
+chro.3.BL <- matrix(chro.3$pval, dimnames = list(rownames(chro.3), "pval"))
+for (i in c(1:30)){
+  chro.3.BL <- cbind(chro.3.BL, blfdr(chro.3$pval, chro.3.X.pca$x[,i]))
+}
+tmp <- c()
+for (i in c(1:30)){tmp[i] <- paste0("BL_PC",i)} 
+colnames(chro.3.BL) <- c("pval", tmp) 
+rm(tmp)
+chro.3.BL <- as.data.frame(chro.3.BL)
+
+# rejected SNPs of BL with PCA
+SNP.BLPCA <- matrix(NA, nrow = 59, ncol = 30)
+for (i in c(2:31)){
+  tmp <- rownames(chro.3.BL %>% filter(chro.3.BL[, i] <= 0.05))
+  SNP.BLPCA[1:length(tmp), i-1] <- tmp
+  rm(tmp)
+}
+
+for (i in c(1:30)){
+  print(paste0(sprintf('rejection # of BL with PC "%s" is ', i), sum(!is.na(SNP.BLPCA[,i]))))
+}
+```
+
+
+
+```{r BL PCA all, echo=FALSE, eval=FALSE}
+blfdr <- function(pValues, x) {
+    pi0hat <- lm_pi0(p = pValues, X = x)
+    adj_p <- pi0hat$pi0 * p.adjust(pValues, method = "BH")
+    return(adj_p)
+}
+
+chro.3.BL <- matrix(chro.3$pval, dimnames = list(rownames(chro.3), "pval"))
+for (i in c(1:30)){
+  chro.3.BL <- cbind(chro.3.BL, blfdr(chro.3$pval, chro.3.X.pca$x[,1:i]))
+}
+tmp <- c()
+for (i in c(1:30)){tmp[i] <- paste0("BL_PC",i)} 
+colnames(chro.3.BL) <- c("pval", tmp) 
+rm(tmp)
+chro.3.BL <- as.data.frame(chro.3.BL)
+
+# rejected SNPs of BL with PCA
+SNP.BLPCA <- matrix(NA, nrow = 59, ncol = 30)
+for (i in c(2:31)){
+  tmp <- rownames(chro.3.BL %>% filter(chro.3.BL[, i] <= 0.05))
+  SNP.BLPCA[1:length(tmp), i-1] <- tmp
+  rm(tmp)
+}
+
+for (i in c(1:30)){
+  print(paste0(sprintf('rejection # of BL with PC "%s" is ', i), sum(!is.na(SNP.BLPCA[,i]))))
+}
+```

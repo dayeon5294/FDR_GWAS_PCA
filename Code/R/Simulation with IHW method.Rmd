@@ -1,0 +1,424 @@
+---
+title: "IHW simulation_cov30"
+author: "Jung Da Yeon"
+date: "2024-02-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 0. Package
+
+```{r, message = FALSE, warning=FALSE}
+#BiocManager::install("genefilter")
+#BiocManager::install("BiocParallel")
+#install_github("nignatiadis/IHW")
+#install_github("nignatiadis/IHWpaper")
+
+library(devtools)
+library(lpsymphony)
+library(IHW)
+library(genefilter)
+library("DESeq2")
+library(qvalue)
+library(BiocParallel)
+#library(IHWpaper)
+library(dplyr)
+library(pracma)
+library(MASS)
+```
+
+
+## 1. Function
+
+```{r fdrcov functions}
+##-----logistic regression version of estimate----------------------------------
+lm_pi0 <- function(pValues, lambda = seq(0.05, 0.95, 0.05), X, smooth.df=3, threshold=TRUE){
+  ##if X is a vector, change it into a matrix
+  if(is.null(dim(X))){ X <- matrix(X, ncol=1)}
+  
+  ##number of tests
+  n <- nrow(X)
+  ##number of lambdas
+  nLambda <- length(lambda)
+  
+  ##get the estimate for each value of lambda 
+  pi0.lambda <- matrix(NA, nrow=n, ncol=nLambda)
+  for(i in 1:nLambda){
+    lambda.i <- lambda[i]
+    y <- pValues > lambda.i
+    
+    ##fit regression
+    regFit <- glm(y ~ as.matrix(X), family=binomial)
+    
+    ##get the estimated values of pi0
+    pi0.lambda[,i] <- regFit$fitted.values/(1-lambda.i)
+    
+    if(threshold){
+      pi0.lambda[,i] <- ifelse(pi0.lambda[,i] > 1, 1, pi0.lambda[,i])
+      pi0.lambda[,i] <- ifelse(pi0.lambda[,i] < 0, 0, pi0.lambda[,i])
+    }
+  }
+  
+  ##smooth over values of lambda (do this for each test in part)
+  pi0.smooth <- matrix(NA, nrow=n, ncol=nLambda)
+  ##also save final estimate (maximum of 0 and minimum of 1 and smoothed value at largest lambda)
+  pi0 <- rep(NA, length=n)
+  for(i in 1:n){
+    if(i %% 10000==0){
+      message(paste("At test #:",i))
+    }
+    spi0 <- smooth.spline(lambda, pi0.lambda[i,], df=smooth.df)
+    pi0.smooth[i, ] <- spi0$y
+    pi0[i] <- pi0.smooth[i,nLambda]
+  }
+  
+  if(threshold){ 
+    pi0 <- ifelse(pi0 > 1, 1, pi0)
+    pi0 <- ifelse(pi0 < 0, 0, pi0)
+  }
+  
+  return(list(pi0=pi0, pi0.lambda=pi0.lambda, lambda=lambda, pi0.smooth=pi0.smooth))
+}
+
+##-----do this without the lm_pi0 function in swfdr-----------------------------
+estimate_pi0x <- function(pValues, X){
+  ntest <- nrow(pValues)
+  
+  ##sequence of lambdas
+  lambdas <- round(seq(0.05, 0.95, 0.05),2)
+  
+  res <- lm_pi0(pValues, lambda=lambdas, X=X, smooth.df=3)
+  
+  pi0Est <- res$pi0
+}
+
+getQValuesSimsFWER <- function(pValues){
+  adj_p <- p.adjust(pValues, method = "bonferroni")
+  return(adj_p)
+}
+
+getQValuesSimsBH <- function(pValues){
+  adj_p <- p.adjust(pValues, method = "BH")
+  return(adj_p)
+}
+
+getQValuesSimsStorey <- function(pValues, a){
+  qval_res <- qvalue(pValues, a)
+  adj_p <- qval_res$qvalues
+  return(adj_p)
+}
+
+getQValuesSimsIHW <- function(pValues, x, a){
+  obj <- ihw(pValues, x, alpha=a, nbins=20, nfolds=5,
+             distrib_estimator="grenander", lp_solver="lpsymphony")
+  result <- adj_pvalues(obj)
+  return(result)
+}
+
+getQValuesSimsBL <- function(pValues, X){
+  pi0hat <- lm_pi0(p = pValues, X = X)
+  adj_p <- pi0hat$pi0 * p.adjust(pValues, method = "BH")
+  return(adj_p)
+}
+```
+
+
+```{r simul functions}
+#---------------- simul with original covariate --------------------------------
+normal_sim <- function(m, pi0, xi_min, xi_max, n_cov=30, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  X   <- runif(m, min=xi_min, max=xi_max)
+  H   <- rbinom(m,1,1-pi0)
+  Z   <- rnorm(m, H*X)
+  random_cov <- matrix(rnorm((n_cov-1)*m), ncol=(n_cov-1))
+  pvalue <- 1-pnorm(Z)
+  simDf <- data.frame(h=H, pvalue=pvalue, x=X, random=random_cov)
+  colnames(simDf)[3:(n_cov+2)] <- paste0("Cov", 1:n_cov)
+  simDf
+}
+
+get_eigenvector <- function(n_cov, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  mean_vec <- rep(0, n_cov)
+  A <- matrix(runif(n_cov * n_cov, min = 0, max = 1), nrow = n_cov, ncol = n_cov)
+  cov_vec <- A %*% t(A)
+  pca_model <- princomp(mvrnorm(n = m, mu = mean_vec, Sigma = cov_vec))
+  eigenvector <- pca_model$loadings
+  eigenvector
+}
+
+for (s in 1:100000){
+  if (s==1){
+    mean_eigenvector <- matrix(get_eigenvector(30, s), ncol=30)
+  }else{
+    new_eigenvector <- matrix(get_eigenvector(30, s), ncol=30)
+    mean_eigenvector <- (mean_eigenvector*(s-1) + new_eigenvector) / s
+  }
+  mean_eigenvector
+}
+
+#---------------- simul with PC transformed covariate --------------------------
+gen_Cov <- function(n_cov, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  A <- matrix(runif(n_cov * n_cov, min = 0, max = 1), nrow = n_cov, ncol = n_cov)
+  cov_vec <- A %*% t(A)
+  cov_vec
+}
+
+gen_Xmatrix <- function(m, n_cov, seed=NULL){
+  mean_vec <- rep(0, n_cov)
+  cov_vec <- gen_Cov(n_cov, seed=1)
+  
+  if (!is.null(seed)) set.seed(seed)
+  df_X <- prcomp(mvrnorm(n = m, mu = mean_vec, Sigma = cov_vec))$x
+  df_X
+}
+
+normal_PC_sim <- function(m, pi0, xi_max, n_cov, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  X      <- gen_Xmatrix(m, n_cov=n_cov, seed=seed)
+  transX <- pnorm(X) * (xi_max-1) + 1
+  H      <- rbinom(m,1,1-pi0)
+  Z      <- rnorm(m, H*transX[,"PC1"])
+  #pvalue <- 2*(1-pnorm(abs(Z)))
+  pvalue <- 1-pnorm(Z)
+  simDf <- data.frame(h=H, pvalue=pvalue, X=X)
+  colnames(simDf)[3:(n_cov+2)] <- paste0("Cov_PC", 1:n_cov)
+  simDf
+}
+```
+
+## 2. Simulation
+
+```{r simulation with original cov, message=FALSE}
+#----------------- Setting ------------------------------------#
+alpha <- 0.05
+ms <- 20000
+nreps <- 100
+n_covs <- 30
+sim_seeds <- 1:nreps
+xi_maxs <- seq(3, 6, length=10)
+ncols <- 1 + 3*(2+n_covs+n_covs)
+
+
+for (eff in xi_maxs[1:10]){
+  print(paste0("Xi_max: ", eff))
+  
+  info <- data.frame(matrix(0, nrow = nreps, ncol = ncols))
+  colnames(info) <- c('disc_true', 'disc_BH', 'FDR_BH', 'TPR_BH', 'disc_Storey', 'FDR_Storey', 'TPR_Storey', 
+                    paste0('disc_IHW_Cov', 1:n_covs), paste0('FDR_IHW_Cov', 1:n_covs), paste0('TPR_IHW_Cov', 1:n_covs), 
+                    paste0('disc_BL_Cov', 1:n_covs), paste0('FDR_BL_Cov', 1:n_covs), paste0('TPR_BL_Cov', 1:n_covs))
+  
+  for (i in 1:nreps){
+    #print(i)
+    if(i%%10==0){print(i)}
+    #----------------- Generate matrix -----------------------------#
+    sim_seed <- sim_seeds[i]
+    df <- normal_sim(m=ms, pi0=0.9, xi_min=1, xi_max=eff, n_cov=n_covs, seed=sim_seed)
+    X = df[,3:(n_cov+2)]
+    info[sim_seed, "disc_true"] <- sum(df$h)
+    
+    #----------------- simple --------------------------------------#
+    qvaluesBH <- getQValuesSimsBH(df$pvalue)
+    disc <- (qvaluesBH <= alpha)
+    info[sim_seed, "disc_BH"] <- sum(disc)
+    info[sim_seed, "FDR_BH"] <- sum(disc * (1-df$h)) / sum(disc)
+    info[sim_seed, "TPR_BH"] <- sum(disc * df$h) / sum(df$h)
+    
+    qvaluesStorey <- getQValuesSimsStorey(df$pvalue, alpha)
+    disc <- (qvaluesStorey <= alpha)
+    info[sim_seed, "disc_Storey"] <- sum(disc)
+    info[sim_seed, "FDR_Storey"] <- sum(disc * (1-df$h)) / sum(disc)
+    info[sim_seed, "TPR_Storey"] <- sum(disc * df$h) / sum(df$h)
+    
+    for (cov in 1:n_covs){
+      #----------------- IHW -----------------------------------------#
+      qvaluesIHW <- getQValuesSimsIHW(df$pvalue, X[,cov], alpha)
+      
+      disc <- (qvaluesIHW <= alpha)
+      info[sim_seed, paste0("disc_IHW_Cov", cov)] <- sum(disc)
+      info[sim_seed, paste0("FDR_IHW_Cov", cov)] <- sum(disc * (1-df$h)) / sum(disc)
+      info[sim_seed, paste0("TPR_IHW_Cov", cov)] <- sum(disc * df$h) / sum(df$h)
+      
+      #----------------- Boca-Leek -----------------------------------#
+      qvaluesBL <- getQValuesSimsBL(df$pvalue, X[,cov])
+      
+      disc <- (qvaluesBL <= alpha)
+      info[sim_seed, paste0("disc_BL_Cov", cov)] <- sum(disc)
+      info[sim_seed, paste0("FDR_BL_Cov", cov)] <- sum(disc * (1-df$h)) / sum(disc)
+      info[sim_seed, paste0("TPR_BL_Cov", cov)] <- sum(disc * df$h) / sum(df$h)
+      }
+    write.csv(info, file = sprintf("../../Data/result_final/simul_IHW/info_simul%d_effsize%f.csv", i, eff), row.names = FALSE)  
+    }
+}
+
+```
+
+
+
+```{r simulation with PC cov, message=FALSE}
+gen_Cov <- function(n_cov, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  A <- matrix(runif(n_cov * n_cov, min = 0, max = 1), nrow = n_cov, ncol = n_cov)
+  cov_vec <- A %*% t(A)
+  cov_vec
+}
+
+gen_Xmatrix <- function(m, n_cov, seed=NULL){
+  mean_vec <- rep(0, n_cov)
+  cov_vec <- gen_Cov(n_cov, seed=1)
+  
+  if (!is.null(seed)) set.seed(seed)
+  df_X <- prcomp(mvrnorm(n = m, mu = mean_vec, Sigma = cov_vec))$x
+  df_X
+}
+
+normal_PC_sim <- function(m, pi0, xi_max, n_cov, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  X      <- gen_Xmatrix(m, n_cov=n_cov, seed=seed)
+  transX <- pnorm(X) * (xi_max-1) + 1
+  H      <- rbinom(m,1,1-pi0)
+  Z      <- rnorm(m, H*transX[,"PC1"])
+  #pvalue <- 2*(1-pnorm(abs(Z)))
+  pvalue <- 1-pnorm(Z)
+  simDf <- data.frame(h=H, pvalue=pvalue, X=X)
+  colnames(simDf)[3:(n_cov+2)] <- paste0("Cov_PC", 1:n_cov)
+  simDf
+}
+#----------------- Setting ------------------------------------#
+alpha <- 0.05
+ms <- 20000
+nreps <- 100
+n_covs <- 30
+sim_seeds <- 1:nreps
+xi_maxs <- c(3,4,5,6)
+ncols <- 1 + 3 + 3*(2+n_covs+n_covs)
+
+info <- data.frame(matrix(0, nrow = nreps, ncol = ncols))
+colnames(info) <- c('disc_true', 'disc_FWER', 'FDR_FWER', 'TPR_FWER', 
+                    'disc_BH', 'FDR_BH', 'TPR_BH', 'disc_Storey', 'FDR_Storey', 'TPR_Storey', 
+                    paste0('disc_IHW_Cov', 1:n_covs), paste0('FDR_IHW_Cov', 1:n_covs), paste0('TPR_IHW_Cov', 1:n_covs), 
+                    paste0('disc_BL_Cov', 1:n_covs), paste0('FDR_BL_Cov', 1:n_covs), paste0('TPR_BL_Cov', 1:n_covs))
+
+
+for (i in 1:nreps){
+  print(i)
+  #----------------- Generate matrix -----------------------------#
+  sim_seed <- sim_seeds[i]
+  df <- normal_PC_sim(m=ms, pi0=0.9, xi_max=xi_maxs[1], n_cov=n_covs, seed=sim_seed)
+  X = df[,3:(n_covs+2)]
+  info[sim_seed, "disc_true"] <- sum(df$h)
+  
+  #----------------- simple --------------------------------------#
+  qvaluesFWER <- getQValuesSimsFWER(df$pvalue)
+  disc <- (qvaluesFWER <= alpha)
+  info[sim_seed, "disc_FWER"] <- sum(disc)
+  info[sim_seed, "FDR_FWER"] <- sum(disc * (1-df$h)) / sum(disc)
+  info[sim_seed, "TPR_FWER"] <- sum(disc * df$h) / sum(df$h)  
+  
+  qvaluesBH <- getQValuesSimsBH(df$pvalue)
+  disc <- (qvaluesBH <= alpha)
+  info[sim_seed, "disc_BH"] <- sum(disc)
+  info[sim_seed, "FDR_BH"] <- sum(disc * (1-df$h)) / sum(disc)
+  info[sim_seed, "TPR_BH"] <- sum(disc * df$h) / sum(df$h)
+  
+  qvaluesStorey <- getQValuesSimsStorey(df$pvalue, alpha)
+  disc <- (qvaluesStorey <= alpha)
+  info[sim_seed, "disc_Storey"] <- sum(disc)
+  info[sim_seed, "FDR_Storey"] <- sum(disc * (1-df$h)) / sum(disc)
+  info[sim_seed, "TPR_Storey"] <- sum(disc * df$h) / sum(df$h)
+  
+  for (cov in 1:n_covs){
+    #----------------- IHW -----------------------------------------#
+    qvaluesIHW <- getQValuesSimsIHW(df$pvalue, X[,cov], alpha)
+    
+    disc <- qvaluesIHW <= alpha
+    info[sim_seed, paste0("disc_IHW_Cov", cov)] <- sum(disc)
+    info[sim_seed, paste0("FDR_IHW_Cov", cov)] <- sum(disc * (1-df$h)) / sum(disc)
+    info[sim_seed, paste0("TPR_IHW_Cov", cov)] <- sum(disc * df$h) / sum(df$h)
+    
+    #----------------- Boca-Leek -----------------------------------#
+    qvaluesBL <- getQValuesSimsBL(df$pvalue, X[,cov])
+    
+    disc <- qvaluesBL <= alpha
+    info[sim_seed, paste0("disc_BL_Cov", cov)] <- sum(disc)
+    info[sim_seed, paste0("FDR_BL_Cov", cov)] <- sum(disc * (1-df$h)) / sum(disc)
+    info[sim_seed, paste0("TPR_BL_Cov", cov)] <- sum(disc * df$h) / sum(df$h)
+  }
+  
+  write.csv(info, file = sprintf("../../Data/result_final/simul_IHW_pca/info_simul%d_effsize%s.csv", i, xi_maxs[1]), row.names = FALSE)  
+}
+```
+
+
+
+```{r simulation with PC cov basic, message=FALSE}
+gen_Cov <- function(n_cov, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  A <- matrix(runif(n_cov * n_cov, min = 0, max = 1), nrow = n_cov, ncol = n_cov)
+  cov_vec <- A %*% t(A)
+  cov_vec
+}
+
+gen_Xmatrix <- function(m, n_cov, seed=NULL){
+  mean_vec <- rep(0, n_cov)
+  cov_vec <- gen_Cov(n_cov, seed=1)
+  
+  if (!is.null(seed)) set.seed(seed)
+  df_X <- prcomp(mvrnorm(n = m, mu = mean_vec, Sigma = cov_vec))$x
+  df_X
+}
+
+normal_PC_sim <- function(m, pi0, xi_max, n_cov, seed=NULL){
+  if (!is.null(seed)) set.seed(seed)
+  X      <- gen_Xmatrix(m, n_cov=n_cov, seed=seed)
+  transX <- pnorm(X) * (xi_max-1) + 1
+  H      <- rbinom(m,1,1-pi0)
+  Z      <- rnorm(m, H*transX[,"PC1"])
+  #pvalue <- 2*(1-pnorm(abs(Z)))
+  pvalue <- 1-pnorm(Z)
+  simDf <- data.frame(h=H, pvalue=pvalue, X=X)
+  colnames(simDf)[3:(n_cov+2)] <- paste0("Cov_PC", 1:n_cov)
+  simDf
+}
+#----------------- Setting ------------------------------------#
+alpha <- 0.05
+ms <- 20000
+nreps <- 100
+n_covs <- 30
+sim_seeds <- 1:nreps
+xi_maxs <- c(3,4,5,6)
+ncols <- 1 + 6
+
+info <- data.frame(matrix(0, nrow = nreps, ncol = ncols))
+colnames(info) <- c('disc_true', 'disc_FWER', 'FDR_FWER', 'TPR_FWER', 
+                    'disc_BH', 'FDR_BH', 'TPR_BH')
+
+for (i in 1:nreps){
+  print(i)
+  #----------------- Generate matrix -----------------------------#
+  sim_seed <- sim_seeds[i]
+  df <- normal_PC_sim(m=ms, pi0=0.9, xi_max=xi_maxs[1], n_cov=n_covs, seed=sim_seed)
+  X = df[,3:(n_covs+2)]
+  info[sim_seed, "disc_true"] <- sum(df$h)
+  
+  #----------------- simple --------------------------------------#
+  qvaluesFWER <- getQValuesSimsFWER(df$pvalue)
+  disc <- (qvaluesFWER <= alpha)
+  info[sim_seed, "disc_FWER"] <- sum(disc)
+  info[sim_seed, "FDR_FWER"] <- sum(disc * (1-df$h)) / sum(disc)
+  info[sim_seed, "TPR_FWER"] <- sum(disc * df$h) / sum(df$h)  
+  
+  qvaluesBH <- getQValuesSimsBH(df$pvalue)
+  disc <- (qvaluesBH <= alpha)
+  info[sim_seed, "disc_BH"] <- sum(disc)
+  info[sim_seed, "FDR_BH"] <- sum(disc * (1-df$h)) / sum(disc)
+  info[sim_seed, "TPR_BH"] <- sum(disc * df$h) / sum(df$h)
+  
+  write.csv(info, file = sprintf("../../Data/result_final/simul_IHW_pca/info_simul%d_effsize%s_basic.csv", i, xi_maxs[1]), row.names = FALSE)  
+}
+```

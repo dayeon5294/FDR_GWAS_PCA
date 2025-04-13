@@ -1,0 +1,194 @@
+---
+title: "BocaLeek Simulation"
+author: "Jung Da Yeon"
+date: "2024-02-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 0. Package
+
+```{r, message = FALSE, warning=FALSE}
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+# BiocManager::install("qvalue")
+# BiocManager::install("IHW")
+# BiocManager::install("DESeq2")
+# BiocManager::install("swfdr")
+
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("doRNG")) install.packages("doRNG")
+
+library(dplyr)
+library(stats)
+library(ggplot2)
+library("DESeq2")
+library(qvalue)
+library("IHW")
+library(swfdr) 
+library(gridExtra)
+
+library(splines)
+library(MASS)
+library(xtable)
+library(doParallel) 
+library(foreach) 
+library(doRNG)
+```
+
+
+
+## 1. Function
+
+```{r functions}
+##-----logistic regression version of estimate----------------------------------
+lm_pi0 <- function(pValues, lambda = seq(0.05, 0.95, 0.05), X, smooth.df=3, threshold=TRUE){
+  ##if X is a vector, change it into a matrix
+  if(is.null(dim(X))){ X <- matrix(X, ncol=1)}
+  
+  ##number of tests
+  n <- nrow(X)
+  ##number of lambdas
+  nLambda <- length(lambda)
+  
+  ##get the estimate for each value of lambda 
+  pi0.lambda <- matrix(NA, nrow=n, ncol=nLambda)
+  for(i in 1:nLambda){
+    lambda.i <- lambda[i]
+    y <- pValues > lambda.i
+    
+    ##fit regression
+    regFit <- glm(y ~ as.matrix(X), family=binomial)
+    
+    ##get the estimated values of pi0
+    pi0.lambda[,i] <- regFit$fitted.values/(1-lambda.i)
+    
+    if(threshold){
+      pi0.lambda[,i] <- ifelse(pi0.lambda[,i] > 1, 1, pi0.lambda[,i])
+      pi0.lambda[,i] <- ifelse(pi0.lambda[,i] < 0, 0, pi0.lambda[,i])
+    }
+  }
+  
+  ##smooth over values of lambda (do this for each test in part)
+  pi0.smooth <- matrix(NA, nrow=n, ncol=nLambda)
+  ##also save final estimate (maximum of 0 and minimum of 1 and smoothed value at largest lambda)
+  pi0 <- rep(NA, length=n)
+  for(i in 1:n){
+    if(i %% 10000==0){
+      message(paste("At test #:",i))
+    }
+    spi0 <- smooth.spline(lambda, pi0.lambda[i,], df=smooth.df)
+    pi0.smooth[i, ] <- spi0$y
+    pi0[i] <- pi0.smooth[i,nLambda]
+  }
+  
+  if(threshold){ 
+    pi0 <- ifelse(pi0 > 1, 1, pi0)
+    pi0 <- ifelse(pi0 < 0, 0, pi0)
+  }
+  
+  return(list(pi0=pi0, pi0.lambda=pi0.lambda, lambda=lambda, pi0.smooth=pi0.smooth))
+}
+
+##-----do this without the lm_pi0 function in swfdr-----------------------------
+estimate_pi0x <- function(pValues, X){
+  ntest <- nrow(pValues)
+  
+  ##sequence of lambdas
+  lambdas <- round(seq(0.05, 0.95, 0.05),2)
+  
+  res <- lm_pi0(pValues, lambda=lambdas, X=X, smooth.df=3)
+  
+  pi0Est <- res$pi0
+}
+
+##-----Function to get q-values for each method---------------------------------
+getQValuesSimsIHW <- function(pValues, x){
+  group <- groups_by_filter(x, nbins = 20)
+  result <- adj_pvalues(ihw(pValues, group, alpha = 0.05))
+  result
+}
+
+getQValuesSimsBL <- function(pValues, X){
+  pi0hat <- lm_pi0(p = pValues, X = X)
+  adj_p <- pi0hat$pi0 * p.adjust(pValues, method = "BH")
+  return(adj_p)
+}
+
+```
+
+
+## 2. Simulation
+
+```{r simulation example}
+# --------- simulation matrix was made in Python -----------
+df = read.csv("../../Data/data_simul/df_MVB_1.csv")
+colnames(df)[3:32] <- paste("Cov", 1:30, sep = "")
+pValues = df$p ; nullHypSims = df$h ; X = df[,3:32] ; X_pca = df[,33:62]
+df
+```
+
+
+```{r IHW example, message=FALSE}
+print(sum(df$h))
+for (cov in 1:30){
+  qvaluesIHW = getQValuesSimsIHW(df$p, X_pca[,cov])
+  disc <- qvaluesIHW <= 0.05
+  fdr <- sum(disc * (1-df$h)) / sum(disc)
+  tpr <- sum(disc * df$h) / sum(df$h)
+  print(paste('Cov', cov, sum(disc), fdr, tpr))
+}
+```
+
+
+```{r simulation with pca, message=FALSE}
+#----------------- Setting ------------------------------------#
+alpha <- 0.05
+ms <- 20000
+nreps <- 100
+n_covs <- 30
+sim_seeds <- 1:nreps
+ncols <- 1 + 6*n_covs
+
+info <- data.frame(matrix(0, nrow = nreps, ncol = ncols))
+colnames(info) <- c('disc_true',
+                    paste0('disc_IHW_Cov', 1:n_covs), paste0('FDR_IHW_Cov', 1:n_covs), paste0('TPR_IHW_Cov', 1:n_covs), 
+                    paste0('disc_BL_Cov', 1:n_covs), paste0('FDR_BL_Cov', 1:n_covs), paste0('TPR_BL_Cov', 1:n_covs))
+
+for (i in 1:nreps){
+  print(i)
+  #----------------- Generate matrix -----------------------------#
+  sim_seed <- sim_seeds[i]
+  df = read.csv(sprintf("../../Data/data_simul_BL/df_MVB_%d.csv", (i)))
+  colnames(df)[3:32] <- paste0("Cov", 1:30)
+  X = df[,3:32] ; X_pca = df[,33:62]
+  
+  info[sim_seed, "disc_true"] <- sum(df$h)
+  
+  for (cov in 1:n_covs){
+    #----------------- IHW -----------------------------------------#
+    qvaluesIHW <- getQValuesSimsIHW(df$p, X_pca[,cov])
+    
+    disc <- (qvaluesIHW <= alpha)
+    info[sim_seed, paste0("disc_IHW_Cov", cov)] <- sum(disc)
+    info[sim_seed, paste0("FDR_IHW_Cov", cov)] <- sum(disc * (1-df$h)) / sum(disc)
+    info[sim_seed, paste0("TPR_IHW_Cov", cov)] <- sum(disc * df$h) / sum(df$h)
+    
+    #----------------- Boca-Leek -----------------------------------#
+    qvaluesBL <- getQValuesSimsBL(df$p, X_pca[,cov])
+    
+    disc <- (qvaluesBL <= alpha)
+    info[sim_seed, paste0("disc_BL_Cov", cov)] <- sum(disc)
+    info[sim_seed, paste0("FDR_BL_Cov", cov)] <- sum(disc * (1-df$h)) / sum(disc)
+    info[sim_seed, paste0("TPR_BL_Cov", cov)] <- sum(disc * df$h) / sum(df$h)
+  }
+  
+  write.csv(info, file = sprintf("../../Data/result_final/simul_BL/info_MVB_simul%d.csv", i), row.names = FALSE)
+}
+write.csv(info, file = "../../Data/result_final/simul_BL/info_MVB_simul100.csv", row.names = FALSE)
+```
+
+
