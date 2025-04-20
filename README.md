@@ -1,4 +1,4 @@
-# FDR-GWAS-PCA
+# FDR_GWAS_PCA
 
 This repository contains selected data and code used in the paper:
 
